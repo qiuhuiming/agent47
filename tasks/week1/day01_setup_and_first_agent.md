@@ -174,78 +174,130 @@ Quick primer on agent architecture:
 Create `src/agent.py`:
 
 ```python
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
-import json
-import structlog
-from tenacity import retry, stop_after_attempt, wait_exponential
+"""
+   _                    _   _  _ _____ 
+  /_\  __ _ ___ _ _  | |_| || |__  |
+ / _ \ / _` / -_) ' \ |  _|__   _/ / 
+/_/ \_\\__, \___|_||_| \__|  |_|/_/  
+       |___/                         
 
-from src.llm_client import LLMClient
-from src.tools.base import Tool, ToolResult
+A ReAct (Reasoning and Acting) Agent Implementation
+
+This module implements the core agent loop following the ReAct pattern:
+1. Think: Generate reasoning about the current state
+2. Act: Decide and execute actions using available tools  
+3. Observe: Process action results and update state
+
+The agent maintains conversation state and iterates until:
+- A final answer is reached
+- Maximum iterations exceeded
+- An error occurs
+"""
+
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass, field
+import json
+import re
+import structlog
+
+from llm_client import LLMClient
+from tools.base import Tool, ToolResult
 
 logger = structlog.get_logger()
 
 @dataclass
 class AgentState:
-    """Track agent execution state"""
+    """Track agent execution state throughout the reasoning process"""
     task: str
-    thoughts: List[str] = None
-    actions: List[Dict[str, Any]] = None
-    observations: List[str] = None
+    thoughts: List[str] = field(default_factory=list)
+    actions: List[Dict[str, Any]] = field(default_factory=list)
+    observations: List[str] = field(default_factory=list)
     final_answer: Optional[str] = None
     iteration_count: int = 0
-    
-    def __post_init__(self):
-        self.thoughts = self.thoughts or []
-        self.actions = self.actions or []
-        self.observations = self.observations or []
+    max_iterations: int = 10
 
 class Agent:
-    """Production-ready ReAct agent"""
+    """
+    ReAct Agent that can reason about tasks and use tools to solve them.
+    
+    The agent follows a loop of:
+    1. Think about the current state and what to do next
+    2. Decide on an action (tool to use)
+    3. Execute the action and observe the result
+    4. Repeat until a final answer is reached
+    """
     
     def __init__(
         self,
         llm_client: LLMClient,
         tools: List[Tool],
-        max_iterations: int = 10
+        max_iterations: int = 10,
+        verbose: bool = False
     ):
         self.llm = llm_client
         self.tools = {tool.name: tool for tool in tools}
         self.max_iterations = max_iterations
+        self.verbose = verbose
         logger.info("Agent initialized", tools=list(self.tools.keys()))
-        
+    
     def run(self, task: str) -> str:
-        """Execute task using ReAct loop"""
+        """
+        Execute a task using the ReAct reasoning loop.
+        
+        Args:
+            task: The task/question to solve
+            
+        Returns:
+            The final answer or error message
+        """
         logger.info("Starting task", task=task)
-        state = AgentState(task=task)
+        state = AgentState(task=task, max_iterations=self.max_iterations)
         
         try:
-            while state.iteration_count < self.max_iterations:
+            while state.iteration_count < state.max_iterations:
                 state.iteration_count += 1
                 
-                # Think
+                if self.verbose:
+                    print(f"\n🤔 Iteration {state.iteration_count}")
+                
+                # Think: Generate reasoning about what to do next
                 thought = self._think(state)
                 state.thoughts.append(thought)
                 
-                # Check if we have final answer
-                if thought.startswith("Final Answer:"):
-                    state.final_answer = thought.replace("Final Answer:", "").strip()
+                if self.verbose:
+                    print(f"💭 Thought: {thought}")
+                
+                # Check for final answer
+                if self._is_final_answer(thought):
+                    state.final_answer = self._extract_final_answer(thought)
                     break
                 
-                # Act
-                action = self._decide_action(state)
-                state.actions.append(action)
-                
-                # Observe
-                observation = self._execute_action(action)
-                state.observations.append(observation)
-                
+                # Act: Decide what action to take
+                action = self._extract_action(thought, state)
+                if action:
+                    state.actions.append(action)
+                    
+                    if self.verbose:
+                        print(f"🔧 Action: {action}")
+                    
+                    # Observe: Execute action and get result
+                    observation = self._execute_action(action)
+                    state.observations.append(observation)
+                    
+                    if self.verbose:
+                        print(f"👁️ Observation: {observation}")
+                else:
+                    # If no action extracted, ask for clarification
+                    state.observations.append("No action was specified. Please specify an action.")
+            
+            # Handle case where we hit iteration limit
             if not state.final_answer:
-                state.final_answer = "I couldn't complete the task within the iteration limit."
-                
+                state.final_answer = self._summarize_findings(state)
+            
             logger.info("Task completed", 
                        iterations=state.iteration_count,
                        answer_preview=state.final_answer[:100])
+            
             return state.final_answer
             
         except Exception as e:
@@ -256,76 +308,181 @@ class Agent:
         """Generate next thought based on current state"""
         prompt = self._build_prompt(state)
         
-        response = self.llm.complete(
-            prompt,
-            stop_sequences=["Action:", "Final Answer:"]
-        )
+        # Get completion from LLM
+        response = self.llm.complete(prompt)
         
         thought = response.strip()
-        logger.debug("Generated thought", thought=thought)
+        logger.debug("Generated thought", thought=thought[:100])
+        
         return thought
     
-    def _decide_action(self, state: AgentState) -> Dict[str, Any]:
-        """Decide which action to take"""
-        # Get the last thought and extract action
-        last_thought = state.thoughts[-1]
+    def _extract_action(self, thought: str, state: AgentState) -> Optional[Dict[str, Any]]:
+        """Extract action from thought using multiple strategies"""
         
-        # Ask LLM for action
-        action_prompt = f"""
-Based on this thought: "{last_thought}"
+        # Strategy 1: Look for explicit Action: format
+        action_match = re.search(r'Action:\s*(\w+)\[(.*?)\]', thought)
+        if action_match:
+            tool_name = action_match.group(1)
+            tool_input = action_match.group(2)
+            return {"tool": tool_name, "input": tool_input}
+        
+        # Strategy 2: Look for tool mentions in thought
+        for tool_name in self.tools:
+            if tool_name in thought.lower():
+                # Try to extract what follows the tool name
+                pattern = rf'{tool_name}.*?["\']([^"\']+)["\']'
+                match = re.search(pattern, thought, re.IGNORECASE)
+                if match:
+                    return {"tool": tool_name, "input": match.group(1)}
+        
+        # Strategy 3: Ask LLM to format action properly
+        if any(word in thought.lower() for word in ['calculate', 'compute', 'need to']):
+            action_prompt = f"""
+Given this thought: "{thought}"
 
 Available tools: {list(self.tools.keys())}
 
-Respond with a JSON action:
-{{"tool": "tool_name", "input": "tool_input"}}
+Extract the action in this exact format:
+Action: tool_name[input]
+
+If no action is needed, respond with: No action needed
 """
+            response = self.llm.complete(action_prompt)
+            
+            # Try to parse the response
+            action_match = re.search(r'Action:\s*(\w+)\[(.*?)\]', response)
+            if action_match:
+                return {
+                    "tool": action_match.group(1),
+                    "input": action_match.group(2)
+                }
         
-        response = self.llm.complete(action_prompt)
-        
-        try:
-            action = json.loads(response)
-            logger.debug("Parsed action", action=action)
-            return action
-        except json.JSONDecodeError:
-            logger.warning("Failed to parse action", response=response)
-            return {"tool": "none", "input": ""}
+        return None
     
     def _execute_action(self, action: Dict[str, Any]) -> str:
-        """Execute the chosen action"""
+        """Execute the chosen action using the appropriate tool"""
         tool_name = action.get("tool")
-        tool_input = action.get("input")
+        tool_input = action.get("input", "")
         
         if tool_name not in self.tools:
-            return f"Error: Unknown tool '{tool_name}'"
+            return f"Error: Unknown tool '{tool_name}'. Available tools: {list(self.tools.keys())}"
         
         try:
             tool = self.tools[tool_name]
             result = tool.execute(tool_input)
-            logger.info("Tool executed", tool=tool_name, success=result.success)
-            return result.output
+            
+            if result.success:
+                logger.info("Tool executed successfully", tool=tool_name)
+                return result.output
+            else:
+                logger.warning("Tool execution failed", tool=tool_name, error=result.error)
+                return f"Tool error: {result.error}"
+                
         except Exception as e:
-            logger.error("Tool execution failed", tool=tool_name, error=str(e))
+            logger.error("Tool execution exception", tool=tool_name, error=str(e))
             return f"Error executing {tool_name}: {str(e)}"
+    
+    def _is_final_answer(self, thought: str) -> bool:
+        """Check if thought contains final answer"""
+        final_patterns = [
+            r'final answer:',
+            r'the answer is:',
+            r'therefore,?\s+the answer',
+            r'in conclusion',
+        ]
+        
+        thought_lower = thought.lower()
+        return any(re.search(pattern, thought_lower) for pattern in final_patterns)
+    
+    def _extract_final_answer(self, thought: str) -> str:
+        """Extract final answer from thought"""
+        # Try different patterns
+        patterns = [
+            r'Final Answer:\s*(.*)',
+            r'The answer is:\s*(.*)',
+            r'Therefore,?\s+the answer is:\s*(.*)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, thought, re.IGNORECASE)
+            if match:
+                return match.group(1).strip()
+        
+        # Fallback: return everything after "answer"
+        answer_idx = thought.lower().find('answer')
+        if answer_idx != -1:
+            return thought[answer_idx + 6:].strip(': ')
+        
+        return thought
+    
+    def _summarize_findings(self, state: AgentState) -> str:
+        """Summarize findings when iteration limit reached"""
+        summary_prompt = f"""
+Task: {state.task}
+
+I performed {state.iteration_count} iterations but couldn't reach a definitive answer.
+
+Here's what I found:
+{self._format_history(state, max_entries=3)}
+
+Please provide a best-effort answer based on the observations above.
+"""
+        
+        response = self.llm.complete(summary_prompt)
+        return response.strip()
     
     def _build_prompt(self, state: AgentState) -> str:
         """Build prompt for next thought"""
-        prompt = f"""You are an AI agent solving this task: {state.task}
+        
+        # System instruction
+        prompt = """You are a ReAct agent that solves problems step by step.
 
-Available tools: {list(self.tools.keys())}
+For each step:
+1. Think about what you need to do
+2. Use tools when needed with format: Action: tool_name[input]
+3. Observe the results
+4. Continue until you have the final answer
 
-Previous thoughts and actions:
+When you have the final answer, start your response with "Final Answer:"
+
 """
         
-        for i, (thought, action, observation) in enumerate(
-            zip(state.thoughts, state.actions, state.observations)
-        ):
-            prompt += f"\nThought {i+1}: {thought}"
-            prompt += f"\nAction {i+1}: {action}"
-            prompt += f"\nObservation {i+1}: {observation}\n"
+        # Add task
+        prompt += f"Task: {state.task}\n\n"
         
+        # Add available tools
+        prompt += f"Available tools:\n"
+        for tool_name, tool in self.tools.items():
+            prompt += f"- {tool_name}: {tool.description}\n"
+        
+        prompt += "\n"
+        
+        # Add history
+        if state.thoughts:
+            prompt += "Previous steps:\n"
+            prompt += self._format_history(state)
+        
+        # Next thought
         prompt += f"\nThought {len(state.thoughts) + 1}: "
         
         return prompt
+    
+    def _format_history(self, state: AgentState, max_entries: Optional[int] = None) -> str:
+        """Format the history of thoughts, actions, and observations"""
+        history = ""
+        
+        # Determine how many entries to show
+        entries = list(zip(state.thoughts, state.actions, state.observations))
+        if max_entries and len(entries) > max_entries:
+            entries = entries[-max_entries:]
+            history += "... (earlier steps omitted) ...\n\n"
+        
+        for i, (thought, action, observation) in enumerate(entries, 1):
+            history += f"Thought {i}: {thought}\n"
+            history += f"Action {i}: {action['tool']}[{action['input']}]\n"
+            history += f"Observation {i}: {observation}\n\n"
+        
+        return history
 ```
 
 ### Task 6: Implement LLM Client (30 min)
